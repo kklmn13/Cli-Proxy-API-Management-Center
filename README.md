@@ -3,8 +3,12 @@
 > 本仓库为上游 Web UI 项目的二次开发版本。
 >
 > 原始/基础功能请参考上游仓库：https://github.com/router-for-me/Cli-Proxy-API-Management-Center
+
+> [!IMPORTANT]
+> 兼容说明：官方 CPA 已移除使用统计 API。
 >
-> 兼容说明：官方 CPA 已移除使用统计 API；如需使用本 fork 的「监控中心」完整功能，请使用仍保留使用统计 API 的旧版 CPA，或使用该 fork 适配的后端：https://github.com/Fwindy/CLIProxyAPI
+> 如需使用本 fork 的「监控中心」完整功能，必须搭配本 fork 适配的后端：
+> https://github.com/Fwindy/CLIProxyAPI
 
 本 README 只记录 **本 fork 相对上游新增/增强的功能点**。
 

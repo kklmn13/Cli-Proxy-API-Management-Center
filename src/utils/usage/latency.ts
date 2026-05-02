@@ -75,9 +75,6 @@ const formatDurationPart = (
   options: Intl.NumberFormatOptions = {}
 ): string => `${formatDurationNumber(value, locale, options)}${getDurationUnitLabel(unit)}`;
 
-/**
- * 从后端字段 latency_ms 提取耗时，并按毫秒解释。
- */
 export function extractLatencyMs(detail: unknown): number | null {
   const record = isRecord(detail) ? detail : null;
   const rawValue = record?.[LATENCY_SOURCE_FIELD];

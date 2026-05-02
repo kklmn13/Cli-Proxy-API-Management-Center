@@ -61,10 +61,13 @@ export interface ModelPrice {
 }
 
 export interface UsageDetail {
+  id?: string;
   timestamp: string;
   source: string;
   auth_index: string | number | null;
   latency_ms?: number;
+  first_byte_latency_ms?: number;
+  generation_ms?: number;
   tokens: {
     input_tokens: number;
     output_tokens: number;
@@ -74,6 +77,7 @@ export interface UsageDetail {
     total_tokens: number;
   };
   thinking?: UsageThinking | null;
+  thinking_effort?: string;
   failed: boolean;
   __modelName?: string;
   __timestampMs?: number;
@@ -84,6 +88,45 @@ export interface UsageDetailWithEndpoint extends UsageDetail {
   __endpointMethod?: string;
   __endpointPath?: string;
   __timestampMs: number;
+}
+
+export interface UsageModelSnapshot {
+  total_requests: number;
+  success_count: number;
+  failure_count: number;
+  total_tokens: number;
+  details: UsageDetail[];
+}
+
+export interface UsageApiSnapshot {
+  total_requests: number;
+  success_count: number;
+  failure_count: number;
+  total_tokens: number;
+  models: Record<string, UsageModelSnapshot>;
+}
+
+export interface UsageStatsSnapshot {
+  total_requests: number;
+  success_count: number;
+  failure_count: number;
+  total_tokens: number;
+  apis: Record<string, UsageApiSnapshot>;
+  requests_by_day: Record<string, number>;
+  requests_by_hour: Record<string, number>;
+  tokens_by_day: Record<string, number>;
+  tokens_by_hour: Record<string, number>;
+}
+
+export interface UsageQueryRange {
+  start?: string;
+  end?: string;
+}
+
+export interface UsageDeleteResponse {
+  deleted?: number;
+  missing?: string[];
+  [key: string]: unknown;
 }
 
 export interface ApiStats {
@@ -174,6 +217,222 @@ const toUsageSummaryFields = (summary: UsageSummary) => ({
   failure_count: summary.failureCount,
   total_tokens: summary.totalTokens,
 });
+
+const toNonNegativeNumber = (value: unknown): number | null => {
+  if (value === null || value === undefined || (typeof value === 'string' && value.trim() === '')) {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return null;
+  }
+  return parsed;
+};
+
+const normalizeUsageTokens = (value: unknown): UsageDetail['tokens'] => {
+  const tokens = isRecord(value) ? value : {};
+  const inputTokens = toNonNegativeNumber(tokens.input_tokens) ?? 0;
+  const outputTokens = toNonNegativeNumber(tokens.output_tokens) ?? 0;
+  const reasoningTokens = toNonNegativeNumber(tokens.reasoning_tokens) ?? 0;
+  const cachedTokens = Math.max(
+    toNonNegativeNumber(tokens.cached_tokens) ?? 0,
+    toNonNegativeNumber(tokens.cache_tokens) ?? 0
+  );
+  const totalTokens =
+    toNonNegativeNumber(tokens.total_tokens) ??
+    inputTokens + outputTokens + reasoningTokens + cachedTokens;
+
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    reasoning_tokens: reasoningTokens,
+    cached_tokens: cachedTokens,
+    ...(tokens.cache_tokens !== undefined ? { cache_tokens: cachedTokens } : {}),
+    total_tokens: totalTokens,
+  };
+};
+
+const normalizeUsageRecordDetail = (
+  detailRaw: unknown,
+  modelName: string,
+  endpoint: string
+): UsageDetailWithEndpoint | null => {
+  const detail = isRecord(detailRaw) ? detailRaw : null;
+  if (!detail || typeof detail.timestamp !== 'string') {
+    return null;
+  }
+
+  const timestamp = detail.timestamp;
+  const timestampMs = parseTimestampMs(timestamp);
+  const id = typeof detail.id === 'string' && detail.id.trim() ? detail.id.trim() : undefined;
+  const latencyMs = toNonNegativeNumber(detail.latency_ms);
+  const firstByteLatencyMs = extractFirstByteLatencyMs(detail);
+  const generationMs = extractGenerationMs(detail);
+  const source =
+    typeof detail.source === 'string'
+      ? detail.source
+      : detail.source === null || detail.source === undefined
+        ? ''
+        : String(detail.source);
+  const thinkingEffort =
+    typeof detail.thinking_effort === 'string' && detail.thinking_effort.trim()
+      ? detail.thinking_effort.trim()
+      : undefined;
+
+  const endpointMatch = endpoint.match(USAGE_ENDPOINT_METHOD_REGEX);
+
+  return {
+    ...(id ? { id } : {}),
+    timestamp,
+    source,
+    auth_index: (detail.auth_index ?? detail.authIndex ?? detail.AuthIndex ?? null) as UsageDetail['auth_index'],
+    ...(latencyMs !== null ? { latency_ms: latencyMs } : {}),
+    ...(firstByteLatencyMs !== null ? { first_byte_latency_ms: firstByteLatencyMs } : {}),
+    ...(generationMs !== null ? { generation_ms: generationMs } : {}),
+    tokens: normalizeUsageTokens(detail.tokens),
+    thinking: normalizeUsageThinking(detail.thinking),
+    ...(thinkingEffort ? { thinking_effort: thinkingEffort } : {}),
+    failed: detail.failed === true,
+    __modelName: modelName,
+    __endpoint: endpoint,
+    __endpointMethod: endpointMatch?.[1]?.toUpperCase(),
+    __endpointPath: endpointMatch?.[2],
+    __timestampMs: Number.isNaN(timestampMs) ? 0 : timestampMs,
+  };
+};
+
+const collectBackendUsageDetails = (usageData: Record<string, unknown>): UsageDetailWithEndpoint[] => {
+  const details: UsageDetailWithEndpoint[] = [];
+
+  Object.entries(usageData).forEach(([endpoint, endpointEntry]) => {
+    if (!isRecord(endpointEntry)) return;
+
+    Object.entries(endpointEntry).forEach(([modelName, recordsRaw]) => {
+      if (!Array.isArray(recordsRaw)) return;
+
+      recordsRaw.forEach((record) => {
+        const detail = normalizeUsageRecordDetail(record, modelName, endpoint);
+        if (detail) {
+          details.push(detail);
+        }
+      });
+    });
+  });
+
+  return details;
+};
+
+export function buildUsageSnapshotFromDetails(
+  details: Iterable<UsageDetailWithEndpoint>
+): UsageStatsSnapshot {
+  const snapshot: UsageStatsSnapshot = {
+    total_requests: 0,
+    success_count: 0,
+    failure_count: 0,
+    total_tokens: 0,
+    apis: {},
+    requests_by_day: {},
+    requests_by_hour: {},
+    tokens_by_day: {},
+    tokens_by_hour: {},
+  };
+
+  for (const detail of details) {
+    const endpoint = detail.__endpoint || 'unknown';
+    const modelName = detail.__modelName || 'unknown';
+    const apiEntry =
+      snapshot.apis[endpoint] ??
+      (snapshot.apis[endpoint] = {
+        total_requests: 0,
+        success_count: 0,
+        failure_count: 0,
+        total_tokens: 0,
+        models: {},
+      });
+    const modelEntry =
+      apiEntry.models[modelName] ??
+      (apiEntry.models[modelName] = {
+        total_requests: 0,
+        success_count: 0,
+        failure_count: 0,
+        total_tokens: 0,
+        details: [],
+      });
+    const totalTokens = extractTotalTokens(detail);
+    const failed = detail.failed === true;
+
+    snapshot.total_requests += 1;
+    apiEntry.total_requests += 1;
+    modelEntry.total_requests += 1;
+
+    if (failed) {
+      snapshot.failure_count += 1;
+      apiEntry.failure_count += 1;
+      modelEntry.failure_count += 1;
+    } else {
+      snapshot.success_count += 1;
+      apiEntry.success_count += 1;
+      modelEntry.success_count += 1;
+    }
+
+    snapshot.total_tokens += totalTokens;
+    apiEntry.total_tokens += totalTokens;
+    modelEntry.total_tokens += totalTokens;
+    modelEntry.details.push(detail);
+
+    if (detail.__timestampMs > 0) {
+      const date = new Date(detail.__timestampMs);
+      const dayKey = date.toISOString().slice(0, 10);
+      const hourKey = date.getUTCHours().toString().padStart(2, '0');
+      snapshot.requests_by_day[dayKey] = (snapshot.requests_by_day[dayKey] ?? 0) + 1;
+      snapshot.requests_by_hour[hourKey] = (snapshot.requests_by_hour[hourKey] ?? 0) + 1;
+      snapshot.tokens_by_day[dayKey] = (snapshot.tokens_by_day[dayKey] ?? 0) + totalTokens;
+      snapshot.tokens_by_hour[hourKey] = (snapshot.tokens_by_hour[hourKey] ?? 0) + totalTokens;
+    }
+  }
+
+  return snapshot;
+}
+
+export function normalizeUsageData(usageData: unknown): UsageStatsSnapshot | Record<string, unknown> | null {
+  const payload = isRecord(usageData) && isRecord(usageData.usage) ? usageData.usage : usageData;
+  const usageRecord = isRecord(payload) ? payload : null;
+  if (!usageRecord) {
+    return null;
+  }
+
+  if (getApisRecord(usageRecord)) {
+    return usageRecord;
+  }
+
+  return buildUsageSnapshotFromDetails(collectBackendUsageDetails(usageRecord));
+}
+
+export function extractGenerationMs(detail: unknown): number | null {
+  const record = isRecord(detail) ? detail : null;
+  const generationMs = toNonNegativeNumber(record?.generation_ms);
+  if (generationMs !== null) {
+    return generationMs;
+  }
+
+  const latencyMs = toNonNegativeNumber(record?.latency_ms);
+  if (latencyMs === null) {
+    return null;
+  }
+
+  const firstByteLatencyMs = toNonNegativeNumber(record?.first_byte_latency_ms);
+  return firstByteLatencyMs === null ? latencyMs : Math.max(latencyMs - firstByteLatencyMs, 0);
+}
+
+export function extractFirstByteLatencyMs(detail: unknown): number | null {
+  const record = isRecord(detail) ? detail : null;
+  const firstByteLatencyMs = toNonNegativeNumber(record?.first_byte_latency_ms);
+  if (firstByteLatencyMs !== null) {
+    return firstByteLatencyMs;
+  }
+
+  return toNonNegativeNumber(record?.latency_ms) !== null ? 0 : null;
+}
 
 export function filterUsageByTimeRange<T>(
   usageData: T,
@@ -297,6 +556,11 @@ const USAGE_SOURCE_PREFIX_KEY = 'k:';
 const USAGE_SOURCE_PREFIX_MASKED = 'm:';
 const USAGE_SOURCE_PREFIX_TEXT = 't:';
 
+const isNormalizedUsageSourceId = (value: string): boolean =>
+  value.startsWith(USAGE_SOURCE_PREFIX_KEY) ||
+  value.startsWith(USAGE_SOURCE_PREFIX_MASKED) ||
+  value.startsWith(USAGE_SOURCE_PREFIX_TEXT);
+
 const KEY_LIKE_TOKEN_REGEX =
   /(sk-[A-Za-z0-9-_]{6,}|sk-ant-[A-Za-z0-9-_]{6,}|AIza[0-9A-Za-z-_]{8,}|AI[a-zA-Z0-9_-]{6,}|hf_[A-Za-z0-9]{6,}|pk_[A-Za-z0-9]{6,}|rk_[A-Za-z0-9]{6,})/;
 const MASKED_TOKEN_HINT_REGEX = /^[^\s]{1,24}(\*{2,}|\.{3}|…)[^\s]{1,24}$/;
@@ -382,6 +646,7 @@ export function normalizeUsageSourceId(
     typeof value === 'string' ? value : value === null || value === undefined ? '' : String(value);
   const trimmed = raw.trim();
   if (!trimmed) return '';
+  if (isNormalizedUsageSourceId(trimmed)) return trimmed;
 
   const extracted = extractRawSecretFromText(trimmed);
   if (extracted) {
@@ -578,9 +843,16 @@ export function collectUsageDetails(usageData: unknown): UsageDetail[] {
         if (!isRecord(detailRaw) || typeof detailRaw.timestamp !== 'string') return;
         const timestamp = detailRaw.timestamp;
         const timestampMs = parseTimestampMs(timestamp);
-        const tokensRaw = isRecord(detailRaw.tokens) ? detailRaw.tokens : {};
         const latencyMs = extractLatencyMs(detailRaw);
+        const generationMs = extractGenerationMs(detailRaw);
+        const firstByteLatencyMs = extractFirstByteLatencyMs(detailRaw);
+        const id = typeof detailRaw.id === 'string' && detailRaw.id.trim() ? detailRaw.id.trim() : undefined;
+        const thinkingEffort =
+          typeof detailRaw.thinking_effort === 'string' && detailRaw.thinking_effort.trim()
+            ? detailRaw.thinking_effort.trim()
+            : undefined;
         details.push({
+          ...(id ? { id } : {}),
           timestamp,
           source: normalizeSource(detailRaw.source),
           auth_index: (detailRaw?.auth_index ??
@@ -588,8 +860,11 @@ export function collectUsageDetails(usageData: unknown): UsageDetail[] {
             detailRaw?.AuthIndex ??
             null) as UsageDetail['auth_index'],
           latency_ms: latencyMs ?? undefined,
-          tokens: tokensRaw as unknown as UsageDetail['tokens'],
+          first_byte_latency_ms: firstByteLatencyMs ?? undefined,
+          generation_ms: generationMs ?? undefined,
+          tokens: normalizeUsageTokens(detailRaw.tokens),
           thinking: normalizeUsageThinking(detailRaw.thinking),
+          ...(thinkingEffort ? { thinking_effort: thinkingEffort } : {}),
           failed: detailRaw.failed === true,
           __modelName: modelName,
           __timestampMs: Number.isNaN(timestampMs) ? 0 : timestampMs,
@@ -655,9 +930,16 @@ export function collectUsageDetailsWithEndpoint(usageData: unknown): UsageDetail
         if (!isRecord(detailRaw) || typeof detailRaw.timestamp !== 'string') return;
         const timestamp = detailRaw.timestamp;
         const timestampMs = parseTimestampMs(timestamp);
-        const tokensRaw = isRecord(detailRaw.tokens) ? detailRaw.tokens : {};
         const latencyMs = extractLatencyMs(detailRaw);
+        const generationMs = extractGenerationMs(detailRaw);
+        const firstByteLatencyMs = extractFirstByteLatencyMs(detailRaw);
+        const id = typeof detailRaw.id === 'string' && detailRaw.id.trim() ? detailRaw.id.trim() : undefined;
+        const thinkingEffort =
+          typeof detailRaw.thinking_effort === 'string' && detailRaw.thinking_effort.trim()
+            ? detailRaw.thinking_effort.trim()
+            : undefined;
         details.push({
+          ...(id ? { id } : {}),
           timestamp,
           source: normalizeSource(detailRaw.source),
           auth_index: (detailRaw?.auth_index ??
@@ -665,8 +947,11 @@ export function collectUsageDetailsWithEndpoint(usageData: unknown): UsageDetail
             detailRaw?.AuthIndex ??
             null) as UsageDetail['auth_index'],
           latency_ms: latencyMs ?? undefined,
-          tokens: tokensRaw as unknown as UsageDetail['tokens'],
+          first_byte_latency_ms: firstByteLatencyMs ?? undefined,
+          generation_ms: generationMs ?? undefined,
+          tokens: normalizeUsageTokens(detailRaw.tokens),
           thinking: normalizeUsageThinking(detailRaw.thinking),
+          ...(thinkingEffort ? { thinking_effort: thinkingEffort } : {}),
           failed: detailRaw.failed === true,
           __modelName: modelName,
           __endpoint: endpoint,

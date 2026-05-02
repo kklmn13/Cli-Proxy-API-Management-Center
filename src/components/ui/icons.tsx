@@ -186,6 +186,14 @@ export function IconTrash2({ size = 20, ...props }: IconProps) {
   );
 }
 
+export function IconMinus({ size = 20, ...props }: IconProps) {
+  return (
+    <svg {...baseSvgProps} width={size} height={size} {...props}>
+      <path d="M5 12h14" />
+    </svg>
+  );
+}
+
 export function IconChevronUp({ size = 20, ...props }: IconProps) {
   return (
     <svg {...baseSvgProps} width={size} height={size} {...props}>

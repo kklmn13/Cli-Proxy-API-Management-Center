@@ -95,6 +95,7 @@ export function MonitoringCenterPage() {
   const resolvedTheme = useThemeStore((state) => state.resolvedTheme);
   const isDark = resolvedTheme === 'dark';
   const config = useConfigStore((state) => state.config);
+  const [timeRange, setTimeRange] = useState<UsageTimeRange>(loadTimeRange);
 
   const {
     usage,
@@ -104,7 +105,7 @@ export function MonitoringCenterPage() {
     modelPrices,
     setModelPrices,
     loadUsage,
-  } = useUsageData();
+  } = useUsageData({ timeRange });
   const [authFiles, setAuthFiles] = useState<AuthFileItem[]>([]);
 
   const loadAuthFiles = useCallback(async () => {
@@ -121,10 +122,11 @@ export function MonitoringCenterPage() {
   useHeaderRefresh(handleRefresh);
 
   useEffect(() => {
-    void loadAuthFiles().catch(() => {});
+    const timer = window.setTimeout(() => {
+      void loadAuthFiles().catch(() => {});
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [loadAuthFiles]);
-
-  const [timeRange, setTimeRange] = useState<UsageTimeRange>(loadTimeRange);
 
   useEffect(() => {
     try {

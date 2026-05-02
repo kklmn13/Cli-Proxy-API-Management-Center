@@ -4,9 +4,11 @@ import { Pie } from 'react-chartjs-2';
 import { useTranslation } from 'react-i18next';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
-import { formatCompactNumber } from '@/utils/usage';
+import { formatCompactNumber, formatUsd } from '@/utils/usage';
 import type { ModelStat } from '@/components/usage';
 import styles from '@/pages/MonitoringCenterPage.module.scss';
+
+type DistributionMetric = 'requests' | 'tokens' | 'cost';
 
 const PIE_COLORS = [
   '#8b5cf6',
@@ -33,13 +35,13 @@ export function ModelUsageDistributionCard({
   isDark
 }: ModelUsageDistributionCardProps) {
   const { t } = useTranslation();
-  const [metric, setMetric] = useState<'requests' | 'tokens'>('requests');
+  const [metric, setMetric] = useState<DistributionMetric>('requests');
 
   const rankedRows = useMemo(() => {
     const sorted = [...modelStats]
       .map((item) => ({
         ...item,
-        value: metric === 'tokens' ? item.tokens : item.requests
+        value: metric === 'cost' ? item.cost : metric === 'tokens' ? item.tokens : item.requests
       }))
       .filter((item) => item.value > 0)
       .sort((a, b) => b.value - a.value);
@@ -77,9 +79,11 @@ export function ModelUsageDistributionCard({
       datasets: [
         {
           label:
-            metric === 'tokens'
-              ? t('usage_stats.total_tokens')
-              : t('usage_stats.total_requests'),
+            metric === 'cost'
+              ? t('usage_stats.total_cost')
+              : metric === 'tokens'
+                ? t('usage_stats.total_tokens')
+                : t('usage_stats.total_requests'),
           data: rankedRows.map((item) => item.value),
           backgroundColor: rankedRows.map((_, index) => PIE_COLORS[index % PIE_COLORS.length]),
           borderColor: isDark ? 'rgba(24, 24, 27, 0.95)' : '#ffffff',
@@ -102,13 +106,14 @@ export function ModelUsageDistributionCard({
             label: (context) => {
               const row = rankedRows[context.dataIndex];
               if (!row) return '';
-              return `${context.label}: ${formatCompactNumber(row.value)} (${row.share.toFixed(1)}%)`;
+              const formattedValue = metric === 'cost' ? formatUsd(row.value) : formatCompactNumber(row.value);
+              return `${context.label}: ${formattedValue} (${row.share.toFixed(1)}%)`;
             }
           }
         }
       }
     }),
-    [rankedRows]
+    [metric, rankedRows]
   );
 
   return (
@@ -129,6 +134,13 @@ export function ModelUsageDistributionCard({
             onClick={() => setMetric('tokens')}
           >
             {t('monitoring_center.metric_tokens')}
+          </Button>
+          <Button
+            variant={metric === 'cost' ? 'primary' : 'secondary'}
+            size="sm"
+            onClick={() => setMetric('cost')}
+          >
+            {t('monitoring_center.metric_cost')}
           </Button>
         </div>
       }
@@ -157,7 +169,9 @@ export function ModelUsageDistributionCard({
                     </span>
                   </div>
                   <span className={styles.legendDot} style={{ backgroundColor: PIE_COLORS[index % PIE_COLORS.length] }} />
-                  <span className={styles.distributionValue}>{formatCompactNumber(row.value)}</span>
+                  <span className={styles.distributionValue}>
+                    {metric === 'cost' ? formatUsd(row.value) : formatCompactNumber(row.value)}
+                  </span>
                 </div>
               ))}
             </div>

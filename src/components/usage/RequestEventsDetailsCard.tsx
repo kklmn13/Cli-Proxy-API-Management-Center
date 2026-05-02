@@ -6,18 +6,20 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { Input } from '@/components/ui/Input';
 import { Modal } from '@/components/ui/Modal';
 import { Select } from '@/components/ui/Select';
+import { IconMinus } from '@/components/ui/icons';
 import { getAuthFileStatusMessage } from '@/features/authFiles/constants';
 import { useInterval } from '@/hooks/useInterval';
 import { authFilesApi } from '@/services/api/authFiles';
+import { useNotificationStore, useUsageStatsStore } from '@/stores';
 import type { GeminiKeyConfig, ProviderKeyConfig, OpenAIProviderConfig } from '@/types';
 import type { AuthFileItem } from '@/types/authFile';
 import type { CredentialInfo } from '@/types/sourceInfo';
 import { buildSourceInfoMap, resolveSourceDisplay } from '@/utils/sourceResolver';
 import { parseTimestampMs } from '@/utils/timestamp';
 import {
-  LATENCY_SOURCE_FIELD,
   collectUsageDetails,
-  extractLatencyMs,
+  extractFirstByteLatencyMs,
+  extractGenerationMs,
   extractTotalTokens,
   formatDurationMs,
   normalizeAuthIndex,
@@ -33,6 +35,7 @@ const MAX_RENDERED_EVENTS = 500;
 
 type RequestEventRow = {
   id: string;
+  backendId: string | null;
   timestamp: string;
   timestampMs: number;
   timestampLabel: string;
@@ -43,7 +46,8 @@ type RequestEventRow = {
   sourceType: string;
   authIndex: string;
   failed: boolean;
-  latencyMs: number | null;
+  firstByteLatencyMs: number | null;
+  generationMs: number | null;
   tps: number | null;
   thinking: UsageThinking | null;
   thinkingLabel: string;
@@ -52,6 +56,7 @@ type RequestEventRow = {
   reasoningTokens: number;
   cachedTokens: number;
   totalTokens: number;
+  cacheHitRatio: number | null;
 };
 
 export interface RequestEventsDetailsCardProps {
@@ -129,6 +134,11 @@ const formatThinkingLabel = (thinking: UsageThinking | null): string => {
   return label;
 };
 
+const formatCacheHitRatio = (ratio: number | null): string => {
+  if (ratio === null) return '--';
+  return `${(ratio * 100).toFixed(1)}%`;
+};
+
 const encodeCsv = (value: string | number): string => {
   const text = String(value ?? '');
   const trimmedLeft = text.replace(/^\s+/, '');
@@ -149,10 +159,8 @@ export function RequestEventsDetailsCard({
   lastRefreshedAt,
 }: RequestEventsDetailsCardProps) {
   const { t, i18n } = useTranslation();
-  const latencyHint = t('usage_stats.latency_unit_hint', {
-    field: LATENCY_SOURCE_FIELD,
-    unit: t('usage_stats.duration_unit_ms'),
-  });
+  const { showConfirmation, showNotification } = useNotificationStore();
+  const deleteUsageRecords = useUsageStatsStore((state) => state.deleteUsageRecords);
 
   const [modelFilter, setModelFilter] = useState(ALL_FILTER);
   const [sourceFilter, setSourceFilter] = useState(ALL_FILTER);
@@ -164,6 +172,7 @@ export function RequestEventsDetailsCard({
   );
   const [localAuthFiles, setLocalAuthFiles] = useState<AuthFileItem[]>([]);
   const [selectedFailureRow, setSelectedFailureRow] = useState<RequestEventRow | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [nextRefreshAtMs, setNextRefreshAtMs] = useState<number | null>(null);
   const [countdownNowMs, setCountdownNowMs] = useState(() => Date.now());
 
@@ -315,13 +324,18 @@ export function RequestEventsDetailsCard({
         toNumber(detail.tokens?.total_tokens),
         extractTotalTokens(detail)
       );
-      const latencyMs = extractLatencyMs(detail);
-      const tps = latencyMs && latencyMs > 0 ? outputTokens / (latencyMs / 1000) : null;
+      const backendId = typeof detail.id === 'string' && detail.id.trim() ? detail.id.trim() : null;
+      const firstByteLatencyMs = extractFirstByteLatencyMs(detail);
+      const generationMs = extractGenerationMs(detail);
+      const tps = generationMs && generationMs > 0 ? outputTokens / (generationMs / 1000) : null;
       const thinking = detail.thinking ?? null;
-      const thinkingLabel = formatThinkingLabel(thinking);
+      const thinkingEffort = normalizeThinkingText(detail.thinking_effort);
+      const thinkingLabel = thinkingEffort || formatThinkingLabel(thinking);
+      const cacheHitRatio = inputTokens > 0 ? cachedTokens / inputTokens : null;
 
       return {
-        id: `${timestamp}-${model}-${sourceKey}-${authIndex}-${index}`,
+        id: backendId ?? `${timestamp}-${model}-${sourceKey}-${authIndex}-${index}`,
+        backendId,
         timestamp,
         timestampMs: Number.isNaN(timestampMs) ? 0 : timestampMs,
         timestampLabel: date ? date.toLocaleString(i18n.language) : timestamp || '-',
@@ -332,7 +346,8 @@ export function RequestEventsDetailsCard({
         sourceType,
         authIndex,
         failed: detail.failed === true,
-        latencyMs,
+        firstByteLatencyMs,
+        generationMs,
         tps,
         thinking,
         thinkingLabel,
@@ -341,6 +356,7 @@ export function RequestEventsDetailsCard({
         reasoningTokens,
         cachedTokens,
         totalTokens,
+        cacheHitRatio,
       };
     });
 
@@ -380,7 +396,10 @@ export function RequestEventsDetailsCard({
       .sort((a, b) => b.timestampMs - a.timestampMs);
   }, [authFileMap, i18n.language, sourceInfoMap, usage]);
 
-  const hasLatencyData = useMemo(() => rows.some((row) => row.latencyMs !== null), [rows]);
+  const hasTimingData = useMemo(
+    () => rows.some((row) => row.firstByteLatencyMs !== null || row.generationMs !== null),
+    [rows]
+  );
 
   const modelOptions = useMemo(
     () => [
@@ -493,18 +512,15 @@ export function RequestEventsDetailsCard({
       'model',
       'source',
       'source_raw',
-      'auth_index',
       'result',
-      ...(hasLatencyData ? ['latency_ms', 'tps'] : []),
-      'thinking_intensity',
-      'thinking_mode',
-      'thinking_level',
-      'thinking_budget',
+      ...(hasTimingData ? ['first_byte_latency_ms', 'generation_ms', 'tps'] : []),
+      'thinking_effort',
       'input_tokens',
       'output_tokens',
       'reasoning_tokens',
       'cached_tokens',
       'total_tokens',
+      'cache_hit_ratio',
     ];
 
     const csvRows = filteredRows.map((row) =>
@@ -513,20 +529,21 @@ export function RequestEventsDetailsCard({
         row.model,
         row.source,
         row.sourceRaw,
-        row.authIndex,
         row.failed ? 'failed' : 'success',
-        ...(hasLatencyData
-          ? [row.latencyMs ?? '', row.tps !== null ? row.tps.toFixed(2) : '']
+        ...(hasTimingData
+          ? [
+              row.firstByteLatencyMs ?? '',
+              row.generationMs ?? '',
+              row.tps !== null ? row.tps.toFixed(2) : '',
+            ]
           : []),
-        row.thinking?.intensity ?? '',
-        row.thinking?.mode ?? '',
-        row.thinking?.level ?? '',
-        row.thinking?.budget ?? '',
+        row.thinkingLabel === '-' ? '' : row.thinkingLabel,
         row.inputTokens,
         row.outputTokens,
         row.reasoningTokens,
         row.cachedTokens,
         row.totalTokens,
+        row.cacheHitRatio !== null ? row.cacheHitRatio.toFixed(4) : '',
       ]
         .map((value) => encodeCsv(value))
         .join(',')
@@ -548,11 +565,13 @@ export function RequestEventsDetailsCard({
       model: row.model,
       source: row.source,
       source_raw: row.sourceRaw,
-      auth_index: row.authIndex,
       failed: row.failed,
-      ...(hasLatencyData && row.latencyMs !== null ? { latency_ms: row.latencyMs } : {}),
-      ...(hasLatencyData && row.tps !== null ? { tps: row.tps } : {}),
-      ...(row.thinking ? { thinking: row.thinking } : {}),
+      ...(hasTimingData && row.firstByteLatencyMs !== null
+        ? { first_byte_latency_ms: row.firstByteLatencyMs }
+        : {}),
+      ...(hasTimingData && row.generationMs !== null ? { generation_ms: row.generationMs } : {}),
+      ...(hasTimingData && row.tps !== null ? { tps: row.tps } : {}),
+      ...(row.thinkingLabel !== '-' ? { thinking_effort: row.thinkingLabel } : {}),
       tokens: {
         input_tokens: row.inputTokens,
         output_tokens: row.outputTokens,
@@ -560,6 +579,7 @@ export function RequestEventsDetailsCard({
         cached_tokens: row.cachedTokens,
         total_tokens: row.totalTokens,
       },
+      ...(row.cacheHitRatio !== null ? { cache_hit_ratio: row.cacheHitRatio } : {}),
     }));
 
     const content = JSON.stringify(payload, null, 2);
@@ -569,6 +589,36 @@ export function RequestEventsDetailsCard({
       blob: new Blob([content], { type: 'application/json;charset=utf-8' }),
     });
   };
+
+  const handleDeleteRow = useCallback(
+    (row: RequestEventRow) => {
+      const backendId = row.backendId;
+      if (!backendId) return;
+      showConfirmation({
+        title: t('usage_stats.request_events_delete_title'),
+        message: t('usage_stats.request_events_delete_confirm'),
+        confirmText: t('common.confirm'),
+        variant: 'danger',
+        onConfirm: async () => {
+          setDeletingId(backendId);
+          try {
+            await deleteUsageRecords([backendId]);
+            showNotification(t('usage_stats.request_events_delete_success'), 'success');
+          } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : '';
+            showNotification(
+              `${t('usage_stats.request_events_delete_failed')}${message ? `: ${message}` : ''}`,
+              'error'
+            );
+            throw err;
+          } finally {
+            setDeletingId(null);
+          }
+        },
+      });
+    },
+    [deleteUsageRecords, showConfirmation, showNotification, t]
+  );
 
   const selectedCredentialInfo = useMemo(() => {
     if (!selectedFailureRow) return null;
@@ -715,7 +765,6 @@ export function RequestEventsDetailsCard({
         <>
           <div className={styles.requestEventsMeta}>
             <span>{t('usage_stats.request_events_count', { count: filteredRows.length })}</span>
-            {hasLatencyData && <span className={styles.requestEventsLimitHint}>{latencyHint}</span>}
             {filteredRows.length > MAX_RENDERED_EVENTS && (
               <span className={styles.requestEventsLimitHint}>
                 {t('usage_stats.request_events_limit_hint', {
@@ -727,27 +776,58 @@ export function RequestEventsDetailsCard({
           </div>
 
           <div className={styles.requestEventsTableWrapper}>
-            <table className={styles.table}>
+            <table className={`${styles.table} ${styles.requestEventsTable}`}>
+              <colgroup>
+                <col className={styles.requestEventsActionCol} />
+                <col className={styles.requestEventsTimestampCol} />
+                <col className={styles.requestEventsModelCol} />
+                <col className={styles.requestEventsSourceCol} />
+                <col className={styles.requestEventsResultCol} />
+                {hasTimingData && <col className={styles.requestEventsTimingCol} />}
+                {hasTimingData && <col className={styles.requestEventsTimingCol} />}
+                {hasTimingData && <col className={styles.requestEventsTimingCol} />}
+                <col className={styles.requestEventsThinkingCol} />
+                <col className={styles.requestEventsTokenCol} />
+                <col className={styles.requestEventsTokenCol} />
+                <col className={styles.requestEventsTokenCol} />
+                <col className={styles.requestEventsTokenCol} />
+                <col className={styles.requestEventsTokenCol} />
+                <col className={styles.requestEventsTokenCol} />
+              </colgroup>
               <thead>
                 <tr>
+                  <th aria-label={t('usage_stats.request_events_delete_action')} />
                   <th>{t('usage_stats.request_events_timestamp')}</th>
                   <th>{t('usage_stats.model_name')}</th>
                   <th>{t('usage_stats.request_events_source')}</th>
-                  <th>{t('usage_stats.request_events_auth_index')}</th>
                   <th>{t('usage_stats.request_events_result')}</th>
-                  {hasLatencyData && <th title={latencyHint}>{t('usage_stats.time')}</th>}
-                  {hasLatencyData && <th>{t('usage_stats.request_events_tps')}</th>}
+                  {hasTimingData && <th>{t('usage_stats.first_byte_latency')}</th>}
+                  {hasTimingData && <th>{t('usage_stats.generation_time')}</th>}
+                  {hasTimingData && <th>{t('usage_stats.request_events_tps')}</th>}
                   <th>{t('usage_stats.thinking_intensity')}</th>
                   <th>{t('usage_stats.input_tokens')}</th>
                   <th>{t('usage_stats.output_tokens')}</th>
                   <th>{t('usage_stats.reasoning_tokens')}</th>
                   <th>{t('usage_stats.cached_tokens')}</th>
                   <th>{t('usage_stats.total_tokens')}</th>
+                  <th>{t('usage_stats.cache_hit')}</th>
                 </tr>
               </thead>
               <tbody>
                 {renderedRows.map((row) => (
                   <tr key={row.id}>
+                    <td className={styles.requestEventsDeleteCell}>
+                      <button
+                        type="button"
+                        className={styles.requestEventsDeleteButton}
+                        onClick={() => handleDeleteRow(row)}
+                        disabled={!row.backendId || deletingId === row.backendId}
+                        title={t('usage_stats.request_events_delete_action')}
+                        aria-label={t('usage_stats.request_events_delete_action')}
+                      >
+                        <IconMinus size={14} />
+                      </button>
+                    </td>
                     <td title={row.timestamp} className={styles.requestEventsTimestamp}>
                       {row.timestampLabel}
                     </td>
@@ -757,9 +837,6 @@ export function RequestEventsDetailsCard({
                       {row.sourceType && (
                         <span className={styles.credentialType}>{row.sourceType}</span>
                       )}
-                    </td>
-                    <td className={styles.requestEventsAuthIndex} title={row.authIndex}>
-                      {row.authIndex}
                     </td>
                     <td>
                       {row.failed ? (
@@ -775,14 +852,17 @@ export function RequestEventsDetailsCard({
                         <span className={styles.requestEventsResultSuccess}>{t('stats.success')}</span>
                       )}
                     </td>
-                    {hasLatencyData && (
-                      <td className={styles.durationCell}>{formatDurationMs(row.latencyMs)}</td>
+                    {hasTimingData && (
+                      <td className={styles.durationCell}>{formatDurationMs(row.firstByteLatencyMs)}</td>
                     )}
-                    {hasLatencyData && <td>{row.tps !== null ? row.tps.toFixed(2) : '--'}</td>}
+                    {hasTimingData && (
+                      <td className={styles.durationCell}>{formatDurationMs(row.generationMs)}</td>
+                    )}
+                    {hasTimingData && <td>{row.tps !== null ? row.tps.toFixed(2) : '--'}</td>}
                     <td>
                       <span
                         className={
-                          row.thinking
+                          row.thinkingLabel !== '-'
                             ? styles.requestEventsThinkingBadge
                             : styles.requestEventsThinkingEmpty
                         }
@@ -812,6 +892,7 @@ export function RequestEventsDetailsCard({
                     <td>{row.reasoningTokens.toLocaleString()}</td>
                     <td>{row.cachedTokens.toLocaleString()}</td>
                     <td>{row.totalTokens.toLocaleString()}</td>
+                    <td>{formatCacheHitRatio(row.cacheHitRatio)}</td>
                   </tr>
                 ))}
               </tbody>
