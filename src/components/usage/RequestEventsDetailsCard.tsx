@@ -601,6 +601,10 @@ export function RequestEventsDetailsCard({
     [deleteUsageRecords, showConfirmation, showNotification, t]
   );
 
+  const handleCloseFailureModal = useCallback(() => {
+    setSelectedFailureRow(null);
+  }, []);
+
   const selectedCredentialInfo = useMemo(() => {
     if (!selectedFailureRow) return null;
     const normalizedAuthIndex = normalizeAuthIndex(selectedFailureRow.authIndex);
@@ -872,7 +876,7 @@ export function RequestEventsDetailsCard({
       <Modal
         open={selectedFailureRow !== null}
         title={t('usage_stats.request_events_failure_log_title')}
-        onClose={() => setSelectedFailureRow(null)}
+        onClose={handleCloseFailureModal}
         width={560}
       >
         {selectedFailureRow && (
