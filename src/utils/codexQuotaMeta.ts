@@ -29,10 +29,10 @@ const THIRTY_DAYS_SECONDS = 2592000;
 const WINDOW_META = {
   codeFiveHour: { id: 'five-hour', labelKey: 'codex_quota.primary_window' },
   codeWeekly: { id: 'weekly', labelKey: 'codex_quota.secondary_window' },
-  codeMonthly: { id: 'monthly', labelKey: 'codex_quota.monthly_window' },
+  codeMonthly: { id: 'monthly', labelKey: 'codex_quota.team_secondary_window' },
   codeReviewFiveHour: { id: 'code-review-five-hour', labelKey: 'codex_quota.code_review_primary_window' },
   codeReviewWeekly: { id: 'code-review-weekly', labelKey: 'codex_quota.code_review_secondary_window' },
-  codeReviewMonthly: { id: 'code-review-monthly', labelKey: 'codex_quota.code_review_monthly_window' },
+  codeReviewMonthly: { id: 'code-review-monthly', labelKey: 'codex_quota.code_review_team_secondary_window' },
 } as const;
 
 export type CodexQuotaWindowKind = 'five-hour' | 'weekly' | 'monthly' | 'other';
@@ -91,7 +91,6 @@ const pickClassifiedWindows = (
 ): {
   fiveHourWindow: CodexUsageWindow | null;
   weeklyWindow: CodexUsageWindow | null;
-  monthlyWindow: CodexUsageWindow | null;
 } => {
   const allowOrderFallback = options?.allowOrderFallback ?? true;
   const primaryWindow = limitInfo?.primary_window ?? limitInfo?.primaryWindow ?? null;
@@ -100,7 +99,6 @@ const pickClassifiedWindows = (
 
   let fiveHourWindow: CodexUsageWindow | null = null;
   let weeklyWindow: CodexUsageWindow | null = null;
-  let monthlyWindow: CodexUsageWindow | null = null;
 
   for (const window of rawWindows) {
     if (!window) continue;
@@ -109,21 +107,20 @@ const pickClassifiedWindows = (
       fiveHourWindow = window;
     } else if (seconds === WEEK_SECONDS && !weeklyWindow) {
       weeklyWindow = window;
-    } else if (seconds === THIRTY_DAYS_SECONDS && !monthlyWindow) {
-      monthlyWindow = window;
     }
   }
 
   if (allowOrderFallback) {
     if (!fiveHourWindow) {
-      fiveHourWindow = primaryWindow && primaryWindow !== weeklyWindow && primaryWindow !== monthlyWindow ? primaryWindow : null;
+      fiveHourWindow = primaryWindow && primaryWindow !== weeklyWindow ? primaryWindow : null;
     }
     if (!weeklyWindow) {
-      weeklyWindow = secondaryWindow && secondaryWindow !== fiveHourWindow && secondaryWindow !== monthlyWindow ? secondaryWindow : null;
+      weeklyWindow =
+        secondaryWindow && secondaryWindow !== fiveHourWindow ? secondaryWindow : null;
     }
   }
 
-  return { fiveHourWindow, weeklyWindow, monthlyWindow };
+  return { fiveHourWindow, weeklyWindow };
 };
 
 const normalizeWindowId = (raw: string) =>
@@ -135,8 +132,10 @@ const normalizeWindowId = (raw: string) =>
 
 export const buildCodexQuotaWindowsWithMeta = (
   payload: CodexUsagePayload,
-  t: TFunction
+  t: TFunction,
+  planType?: string | null
 ): { windows: CodexQuotaWindow[]; meta: CodexQuotaMeta } => {
+  const isTeamPlan = normalizePlanType(planType) === 'team';
   const rateLimit = payload.rate_limit ?? payload.rateLimit ?? undefined;
   const codeReviewLimit = payload.code_review_rate_limit ?? payload.codeReviewRateLimit ?? undefined;
   const additionalRateLimits = payload.additional_rate_limits ?? payload.additionalRateLimits ?? [];
@@ -181,21 +180,13 @@ export const buildCodexQuotaWindowsWithMeta = (
     rawLimitReached,
     rawAllowed
   );
+  const codeSecondaryWindowMeta = isTeamPlan ? WINDOW_META.codeMonthly : WINDOW_META.codeWeekly;
   addWindow(
-    WINDOW_META.codeWeekly.id,
-    t(WINDOW_META.codeWeekly.labelKey),
-    WINDOW_META.codeWeekly.labelKey,
+    codeSecondaryWindowMeta.id,
+    t(codeSecondaryWindowMeta.labelKey),
+    codeSecondaryWindowMeta.labelKey,
     undefined,
     rateWindows.weeklyWindow,
-    rawLimitReached,
-    rawAllowed
-  );
-  addWindow(
-    WINDOW_META.codeMonthly.id,
-    t(WINDOW_META.codeMonthly.labelKey),
-    WINDOW_META.codeMonthly.labelKey,
-    undefined,
-    rateWindows.monthlyWindow,
     rawLimitReached,
     rawAllowed
   );
@@ -212,21 +203,15 @@ export const buildCodexQuotaWindowsWithMeta = (
     codeReviewLimitReached,
     codeReviewAllowed
   );
+  const codeReviewSecondaryWindowMeta = isTeamPlan
+    ? WINDOW_META.codeReviewMonthly
+    : WINDOW_META.codeReviewWeekly;
   addWindow(
-    WINDOW_META.codeReviewWeekly.id,
-    t(WINDOW_META.codeReviewWeekly.labelKey),
-    WINDOW_META.codeReviewWeekly.labelKey,
+    codeReviewSecondaryWindowMeta.id,
+    t(codeReviewSecondaryWindowMeta.labelKey),
+    codeReviewSecondaryWindowMeta.labelKey,
     undefined,
     codeReviewWindows.weeklyWindow,
-    codeReviewLimitReached,
-    codeReviewAllowed
-  );
-  addWindow(
-    WINDOW_META.codeReviewMonthly.id,
-    t(WINDOW_META.codeReviewMonthly.labelKey),
-    WINDOW_META.codeReviewMonthly.labelKey,
-    undefined,
-    codeReviewWindows.monthlyWindow,
     codeReviewLimitReached,
     codeReviewAllowed
   );
@@ -242,7 +227,9 @@ export const buildCodexQuotaWindowsWithMeta = (
         `additional-${index + 1}`;
 
       const idPrefix = normalizeWindowId(limitName) || `additional-${index + 1}`;
-      const additionalWindows = pickClassifiedWindows(rateInfo, { allowOrderFallback: false });
+      const additionalPrimaryWindow = rateInfo.primary_window ?? rateInfo.primaryWindow ?? null;
+      const additionalSecondaryWindow =
+        rateInfo.secondary_window ?? rateInfo.secondaryWindow ?? null;
       const additionalLimitReached = rateInfo.limit_reached ?? rateInfo.limitReached;
       const additionalAllowed = rateInfo.allowed;
 
@@ -251,25 +238,20 @@ export const buildCodexQuotaWindowsWithMeta = (
         t('codex_quota.additional_primary_window', { name: limitName }),
         'codex_quota.additional_primary_window',
         { name: limitName },
-        additionalWindows.fiveHourWindow,
+        additionalPrimaryWindow,
         additionalLimitReached,
         additionalAllowed
       );
+      const additionalSecondaryLabelKey = isTeamPlan
+        ? 'codex_quota.additional_team_secondary_window'
+        : 'codex_quota.additional_secondary_window';
+      const additionalSecondaryId = isTeamPlan ? 'monthly' : 'weekly';
       addWindow(
-        `${idPrefix}-weekly-${index}`,
-        t('codex_quota.additional_secondary_window', { name: limitName }),
-        'codex_quota.additional_secondary_window',
+        `${idPrefix}-${additionalSecondaryId}-${index}`,
+        t(additionalSecondaryLabelKey, { name: limitName }),
+        additionalSecondaryLabelKey,
         { name: limitName },
-        additionalWindows.weeklyWindow,
-        additionalLimitReached,
-        additionalAllowed
-      );
-      addWindow(
-        `${idPrefix}-monthly-${index}`,
-        t('codex_quota.additional_monthly_window', { name: limitName }),
-        'codex_quota.additional_monthly_window',
-        { name: limitName },
-        additionalWindows.monthlyWindow,
+        additionalSecondaryWindow,
         additionalLimitReached,
         additionalAllowed
       );
@@ -322,14 +304,15 @@ export const fetchCodexQuotaWithMeta = async (
   }
 
   const planTypeFromUsage = normalizePlanType(payload.plan_type ?? payload.planType);
+  const planType = planTypeFromUsage ?? planTypeFromFile;
   const resetCredits = payload.rate_limit_reset_credits ?? payload.rateLimitResetCredits ?? null;
   const rateLimitResetCreditsAvailableCount = normalizeNumberValue(
     resetCredits?.available_count ?? resetCredits?.availableCount
   );
-  const { windows, meta } = buildCodexQuotaWindowsWithMeta(payload, t);
+  const { windows, meta } = buildCodexQuotaWindowsWithMeta(payload, t, planType);
   return {
     data: {
-      planType: planTypeFromUsage ?? planTypeFromFile,
+      planType,
       subscriptionActiveUntil,
       rateLimitResetCreditsAvailableCount,
       windows,
